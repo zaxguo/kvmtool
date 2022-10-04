@@ -155,21 +155,48 @@ void kvm_cpu__select_features(struct kvm *kvm, struct kvm_vcpu_init *init)
 		init->features[0] |= 1UL << KVM_ARM_VCPU_SVE;
 }
 
-int kvm_cpu__configure_features(struct kvm_cpu *vcpu)
+static int kvm_cpu__configure_sve(struct kvm_cpu *vcpu)
 {
+	int vq;
 	struct kvm *kvm = vcpu->kvm;
+	int feature = KVM_ARM_VCPU_SVE;
+	u64 sve_vls[KVM_ARM64_SVE_VLS_WORDS];
+	struct kvm_one_reg reg = {
+		.id = KVM_REG_ARM64_SVE_VLS,
+		.addr = (u64)&sve_vls,
+	};
 
-	if (!kvm->cfg.arch.disable_sve &&
-	    kvm__supports_vm_extension(kvm, KVM_CAP_ARM_SVE)) {
-		int feature = KVM_ARM_VCPU_SVE;
+	if (kvm->cfg.arch.disable_sve ||
+	    !kvm__supports_vm_extension(kvm, KVM_CAP_ARM_SVE))
+		return 0;
 
-		if (ioctl(vcpu->vcpu_fd, KVM_ARM_VCPU_FINALIZE, &feature)) {
-			pr_err("KVM_ARM_VCPU_FINALIZE: %s", strerror(errno));
+	if (kvm->cfg.arch.sve_vl) {
+		if (ioctl(vcpu->vcpu_fd, KVM_GET_ONE_REG, &reg) < 0) {
+			perror("KVM_GET_ONE_REG failed (SVE_VLS)");
+			return -1;
+		}
+
+		/* Clear VLs greater than what the user requested */
+		for (vq = kvm->arch.sve_vq + 1; vq < SVE_VQ_MAX - SVE_VQ_MIN; vq++)
+			sve_vls[vq / 64] &= ~(1ULL << (vq % 64));
+
+		if (ioctl(vcpu->vcpu_fd, KVM_SET_ONE_REG, &reg) < 0) {
+			perror("KVM_SET_ONE_REG failed (SVE_VLS)");
 			return -1;
 		}
 	}
 
+	if (ioctl(vcpu->vcpu_fd, KVM_ARM_VCPU_FINALIZE, &feature)) {
+		pr_err("KVM_ARM_VCPU_FINALIZE: %s", strerror(errno));
+		return -1;
+	}
+
 	return 0;
+}
+
+int kvm_cpu__configure_features(struct kvm_cpu *vcpu)
+{
+	return kvm_cpu__configure_sve(vcpu);
 }
 
 void kvm_cpu__reset_vcpu(struct kvm_cpu *vcpu)
