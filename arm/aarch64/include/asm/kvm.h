@@ -505,6 +505,13 @@ struct kvm_smccc_filter {
 #define KVM_HYPERCALL_EXIT_SMC		(1U << 0)
 #define KVM_HYPERCALL_EXIT_16BIT	(1U << 1)
 
+#define ARM_SMCCC_KVM_FUNC_MEM_SHARE		3
+#define ARM_SMCCC_KVM_FUNC_MEM_UNSHARE		4
+
+#define KVM_EXIT_HYPERCALL_VALID_MASK	((1ULL << ARM_SMCCC_KVM_FUNC_MEM_SHARE) |	\
+					 (1ULL << ARM_SMCCC_KVM_FUNC_MEM_UNSHARE))
+
+
 #endif
 
 #endif /* __ARM_KVM_H__ */
