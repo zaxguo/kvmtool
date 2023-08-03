@@ -194,7 +194,7 @@ int kvm__exit(struct kvm *kvm)
 core_exit(kvm__exit);
 
 
-static int set_user_memory_region(int vm_fd, u32 slot, u32 flags,
+static int set_user_memory_region(struct kvm *kvm, u32 slot, u32 flags,
 				  u64 guest_phys, u64 size,
 				  u64 userspace_addr)
 {
@@ -207,14 +207,14 @@ static int set_user_memory_region(int vm_fd, u32 slot, u32 flags,
 		.userspace_addr		= (unsigned long)userspace_addr,
 	};
 
-	ret = ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &mem);
+	ret = ioctl(kvm->vm_fd, KVM_SET_USER_MEMORY_REGION, &mem);
 	if (ret < 0)
 		ret = -errno;
 
 	return ret;
 }
 
-static int set_user_memory_region2(int vm_fd, u32 slot, u32 flags,
+static int set_user_memory_region2(struct kvm *kvm, u32 slot, u32 flags,
 				   u64 guest_phys, u64 size,
 				   u64 userspace_addr, u32 fd, u64 offset)
 {
@@ -231,18 +231,21 @@ static int set_user_memory_region2(int vm_fd, u32 slot, u32 flags,
 	struct kvm_memory_attributes attr = {
 			.address = guest_phys,
 			.size = size,
-			.attributes = KVM_MEMORY_ATTRIBUTE_PRIVATE,
+			.attributes = 0,
 			.flags = 0,
 		};
 
-	ret = ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION2, &mem);
+	if (kvm->cfg.pkvm)
+		attr.attributes = KVM_MEMORY_ATTRIBUTE_PRIVATE;
+
+	ret = ioctl(kvm->vm_fd, KVM_SET_USER_MEMORY_REGION2, &mem);
 	if (ret < 0) {
 		ret = -errno;
 		goto out;
 	}
 
 	/* Inform KVM that the region is protected. */
-	ret = ioctl(vm_fd, KVM_SET_MEMORY_ATTRIBUTES, &attr);
+	ret = ioctl(kvm->vm_fd, KVM_SET_MEMORY_ATTRIBUTES, &attr);
 	//if (ret || attr.size != 0)
 	if (ret) // TODO: might change
 		ret = -errno;
@@ -276,12 +279,12 @@ int kvm__destroy_mem(struct kvm *kvm, u64 guest_phys, u64 size,
 		goto out;
 	}
 
-	if (kvm->cfg.restricted_mem && (bank->type & KVM_MEM_TYPE_PRIVATE))
-		ret = set_user_memory_region2(kvm->vm_fd, bank->slot,
+	if (kvm->cfg.restricted_mem && (bank->type & KVM_MEM_TYPE_GUESTFD))
+		ret = set_user_memory_region2(kvm, bank->slot,
 			KVM_MEM_PRIVATE, guest_phys, 0, (u64) userspace_addr,
 			0, 0);
 	else
-		ret = set_user_memory_region(kvm->vm_fd, bank->slot, 0,
+		ret = set_user_memory_region(kvm, bank->slot, 0,
 			guest_phys, 0, (u64) userspace_addr);
 	if (ret < 0)
 		goto out;
@@ -382,13 +385,17 @@ int kvm__register_mem(struct kvm *kvm, u64 guest_phys, u64 size,
 		flags |= KVM_MEM_READONLY;
 
 	if (type != KVM_MEM_TYPE_RESERVED) {
-		if (kvm->cfg.restricted_mem && (type & KVM_MEM_TYPE_PRIVATE))
-			ret = set_user_memory_region2(kvm->vm_fd, slot,
+		if (kvm->cfg.restricted_mem && (type & KVM_MEM_TYPE_GUESTFD)) {
+			if (kvm->cfg.pkvm)
+				flags |= KVM_MEM_PRIVATE;
+
+			ret = set_user_memory_region2(kvm, slot,
 				flags | KVM_MEM_PRIVATE, guest_phys, size,
 				(u64) userspace_addr, memfd, offset);
-		else
-			ret = set_user_memory_region(kvm->vm_fd, slot, flags,
+		} else {
+			ret = set_user_memory_region(kvm, slot, flags,
 				guest_phys, size, (u64) userspace_addr);
+		}
 		if (ret < 0)
 			goto out;
 	}
@@ -642,7 +649,7 @@ void map_guest(struct kvm *kvm)
 
 void unmap_guest_private(struct kvm *kvm)
 {
-	kvm__for_each_mem_bank(kvm, KVM_MEM_TYPE_PRIVATE, unmap_bank, NULL);
+	kvm__for_each_mem_bank(kvm, KVM_MEM_TYPE_GUESTFD, unmap_bank, NULL);
 }
 
 int kvm__recommended_cpus(struct kvm *kvm)
