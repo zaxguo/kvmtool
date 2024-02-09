@@ -38,7 +38,6 @@
 #define LOGLEVEL_DEBUG		3
 
 #define PROT_RW (PROT_READ|PROT_WRITE)
-#define MAP_ANON_NORESERVE (MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE)
 
 extern void die(const char *err, ...) NORETURN __attribute__((format (printf, 1, 2)));
 extern void die_perror(const char *s) NORETURN;
@@ -146,7 +145,9 @@ static inline int pow2_size(unsigned long x)
 }
 
 struct kvm;
-void *mmap_hugetlbfs(struct kvm *kvm, const char *htlbfs_path, u64 size);
+int memfd_alloc(struct kvm *kvm, size_t size, bool hugetlb, u64 hugepage_size);
+void *mmap_anon_or_hugetlbfs_align(struct kvm *kvm, const char *hugetlbfs_path,
+				   u64 size, u64 align);
 void *mmap_anon_or_hugetlbfs(struct kvm *kvm, const char *hugetlbfs_path, u64 size);
 
 #endif /* KVM__UTIL_H */

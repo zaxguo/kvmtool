@@ -12,6 +12,7 @@ struct kvm;
 unsigned long long kvm__arch_get_kern_offset(struct kvm *kvm, int fd);
 int kvm__arch_get_ipa_limit(struct kvm *kvm);
 void kvm__arch_enable_mte(struct kvm *kvm);
+void kvm__arch_enable_exit_hypcall(struct kvm *kvm);
 
 static inline bool is_arm64_image(const void *header)
 {

@@ -237,6 +237,10 @@ static int loglevel_parser(const struct option *opt, const char *arg, int unset)
 		     virtio_transport_parser, NULL),			\
 	OPT_CALLBACK('\0', "loglevel", NULL, "[error|warning|info|debug]",\
 			"Set the verbosity level", loglevel_parser, NULL),\
+	OPT_BOOLEAN('\0', "restricted_mem", &(cfg)->restricted_mem,	\
+		    "Use restricted memory for guests"),		\
+	OPT_BOOLEAN('\0', "pkvm", &(cfg)->pkvm,				\
+		    "Spawn a protected VM (pkvm)"),			\
 									\
 	OPT_GROUP("Kernel options:"),					\
 	OPT_STRING('k', "kernel", &(cfg)->kernel_filename, "kernel",	\
@@ -826,6 +830,11 @@ static struct kvm *kvm_cmd_run_init(int argc, const char **argv)
 
 	if (init_list__init(kvm) < 0)
 		die ("Initialisation failed");
+
+	if (kvm->cfg.restricted_mem && kvm->cfg.pkvm) {
+		unmap_guest_private(kvm);
+		set_guest_memory_private(kvm);
+	}
 
 	return kvm;
 }

@@ -208,6 +208,9 @@ int kvm__get_vm_type(struct kvm *kvm)
 	if (ipa_bits > max_ipa_bits)
 		die("Memory too large for this system (needs %d bits, %d available)", ipa_bits, max_ipa_bits);
 
+	if (kvm->cfg.pkvm)
+		vm_type |= (1U << 31);
+
 	vm_type |= KVM_VM_TYPE_ARM_IPA_SIZE(ipa_bits);
 	return vm_type;
 }
@@ -253,4 +256,27 @@ u64 kvm__arch_get_virtio_host_features(struct kvm *kvm)
 	if (kvm__is_realm(kvm))
 		features |= (1ULL << VIRTIO_F_ACCESS_PLATFORM);
 	return features;
+}
+
+void kvm__arch_enable_exit_hypcall(struct kvm *kvm)
+{
+	struct kvm_enable_cap cap = {
+		.cap = KVM_CAP_EXIT_HYPERCALL,
+		.args[0] = KVM_EXIT_HYPERCALL_VALID_MASK,
+	};
+
+	if (kvm->cfg.arch.aarch32_guest) {
+		pr_debug("EXIT HYPERCALL is incompatible with AArch32");
+		return;
+	}
+
+	if (!kvm__supports_extension(kvm, KVM_CAP_EXIT_HYPERCALL)) {
+		pr_debug("EXIT HYPERCALL capability not available");
+		return;
+	}
+
+	if (ioctl(kvm->vm_fd, KVM_ENABLE_CAP, &cap))
+		die_perror("KVM_ENABLE_CAP(KVM_CAP_EXIT_HYPERCALL)");
+
+	pr_debug("EXIT capability enabled");
 }

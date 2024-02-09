@@ -6,6 +6,7 @@
 
 #include <kvm/kvm.h>
 #include <linux/magic.h>	/* For HUGETLBFS_MAGIC */
+#include <linux/memfd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -104,53 +105,121 @@ void die_perror(const char *s)
 	exit(1);
 }
 
-void *mmap_hugetlbfs(struct kvm *kvm, const char *htlbfs_path, u64 size)
+static u64 get_hugepage_blk_size(const char *hugetlbfs_path)
 {
-	char mpath[PATH_MAX];
-	int fd;
 	struct statfs sfs;
-	void *addr;
-	unsigned long blk_size;
 
-	if (statfs(htlbfs_path, &sfs) < 0)
-		die("Can't stat %s\n", htlbfs_path);
+	if (statfs(hugetlbfs_path, &sfs) < 0)
+		die("Can't stat %s", hugetlbfs_path);
 
 	if ((unsigned int)sfs.f_type != HUGETLBFS_MAGIC)
-		die("%s is not hugetlbfs!\n", htlbfs_path);
+		die("%s is not hugetlbfs!", hugetlbfs_path);
 
-	blk_size = (unsigned long)sfs.f_bsize;
-	if (sfs.f_bsize == 0 || blk_size > size) {
-		die("Can't use hugetlbfs pagesize %ld for mem size %lld\n",
-			blk_size, (unsigned long long)size);
-	}
-
-	kvm->ram_pagesize = blk_size;
-
-	snprintf(mpath, PATH_MAX, "%s/kvmtoolXXXXXX", htlbfs_path);
-	fd = mkstemp(mpath);
-	if (fd < 0)
-		die("Can't open %s for hugetlbfs map\n", mpath);
-	unlink(mpath);
-	if (ftruncate(fd, size) < 0)
-		die("Can't ftruncate for mem mapping size %lld\n",
-			(unsigned long long)size);
-	addr = mmap(NULL, size, PROT_RW, MAP_PRIVATE, fd, 0);
-	close(fd);
-
-	return addr;
+	return sfs.f_bsize;
 }
 
-/* This function wraps the decision between hugetlbfs map (if requested) or normal mmap */
+static int guest_memfd_alloc(struct kvm *kvm, size_t size, bool hugetlb, u64 blk_size)
+{
+	struct kvm_create_guest_memfd gmem = {
+		.size = size,
+		.flags = 0,
+	};
+
+	BUG_ON(hugetlb);
+
+	return ioctl(kvm->vm_fd, KVM_CREATE_GUEST_MEMFD, &gmem);
+}
+
+int memfd_alloc(struct kvm *kvm, size_t size, bool hugetlb, u64 blk_size)
+{
+	const char *name = "kvmtool";
+	unsigned int flags = 0;
+	int fd;
+
+	if (hugetlb) {
+		if (!is_power_of_two(blk_size))
+			die("Hugepage size must be a power of 2");
+
+		flags |= MFD_HUGETLB;
+		flags |= blk_size << MFD_HUGE_SHIFT;
+	}
+
+	fd = memfd_create(name, flags);
+	if (fd < 0)
+		die_perror("Can't memfd_create for memory map");
+
+	if (ftruncate(fd, size) < 0)
+		die("Can't ftruncate for mem mapping size %lld",
+			(unsigned long long)size);
+
+	return fd;
+}
+
+/*
+ * This function allocates memory aligned to align_sz.
+ * It also wraps the decision between hugetlbfs (if requested) or normal mmap.
+ */
+void *mmap_anon_or_hugetlbfs_align(struct kvm *kvm, const char *hugetlbfs_path,
+				   u64 size, u64 align_sz)
+{
+	u64 blk_size = 0;
+	u64 total_map = size + align_sz;
+	u64 start_off, end_off;
+	void *addr_map, *addr_align;
+	int fd;
+
+	/*
+	 * We don't /need/ to map guest RAM from hugetlbfs, but we do so
+	 * if the user specifies a hugetlbfs path.
+	 */
+	if (hugetlbfs_path) {
+		blk_size = get_hugepage_blk_size(hugetlbfs_path);
+
+		if (blk_size == 0 || blk_size > size) {
+			die("Can't use hugetlbfs pagesize %lld for mem size %lld",
+				(unsigned long long)blk_size, (unsigned long long)size);
+		}
+
+		kvm->ram_pagesize = blk_size;
+	} else {
+		kvm->ram_pagesize = getpagesize();
+	}
+
+	/* Create a mapping with room for alignment without allocating. */
+	addr_map = mmap(NULL, total_map, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS,
+			-1, 0);
+	if (addr_map == MAP_FAILED)
+		return MAP_FAILED;
+
+	if (kvm->cfg.restricted_mem)
+		fd = guest_memfd_alloc(kvm, size, hugetlbfs_path, blk_size);
+	else
+		fd = memfd_alloc(kvm, size, hugetlbfs_path, blk_size);
+	if (fd < 0)
+		return MAP_FAILED;
+
+	/* Map the allocated memory in the fd to the specified alignment. */
+	addr_align = (void *)ALIGN((u64)addr_map, align_sz);
+	if (mmap(addr_align, size, PROT_RW, MAP_SHARED | MAP_FIXED, fd, 0) ==
+	    MAP_FAILED) {
+		close(fd);
+		return MAP_FAILED;
+	}
+
+	/* Remove the mapping for unused address ranges. */
+	start_off = addr_align - addr_map;
+	if (start_off)
+		munmap(addr_map, start_off);
+
+	end_off = align_sz - start_off;
+	if (end_off)
+		munmap((void *)((u64)addr_align + size), end_off);
+
+	kvm->ram_fd = fd;
+	return addr_align;
+}
+
 void *mmap_anon_or_hugetlbfs(struct kvm *kvm, const char *hugetlbfs_path, u64 size)
 {
-	if (hugetlbfs_path)
-		/*
-		 * We don't /need/ to map guest RAM from hugetlbfs, but we do so
-		 * if the user specifies a hugetlbfs path.
-		 */
-		return mmap_hugetlbfs(kvm, hugetlbfs_path, size);
-	else {
-		kvm->ram_pagesize = getpagesize();
-		return mmap(NULL, size, PROT_RW, MAP_ANON_NORESERVE, -1, 0);
-	}
+	return mmap_anon_or_hugetlbfs_align(kvm, hugetlbfs_path, size, 0);
 }

@@ -111,7 +111,7 @@ void kvm__init_ram(struct kvm *kvm)
 		phys_size  = kvm->ram_size;
 		host_mem   = kvm->ram_start;
 
-		kvm__register_ram(kvm, phys_start, phys_size, host_mem);
+		kvm__register_ram(kvm, phys_start, phys_size, host_mem, kvm->ram_fd, 0);
 	} else {
 		/* First RAM range from zero to the PCI gap: */
 
@@ -119,7 +119,7 @@ void kvm__init_ram(struct kvm *kvm)
 		phys_size  = KVM_32BIT_GAP_START;
 		host_mem   = kvm->ram_start;
 
-		kvm__register_ram(kvm, phys_start, phys_size, host_mem);
+		kvm__register_ram(kvm, phys_start, phys_size, host_mem, kvm->ram_fd, 0);
 
 		/* Second RAM range from 4GB to the end of RAM: */
 
@@ -127,7 +127,7 @@ void kvm__init_ram(struct kvm *kvm)
 		phys_size  = kvm->ram_size - phys_start;
 		host_mem   = kvm->ram_start + phys_start;
 
-		kvm__register_ram(kvm, phys_start, phys_size, host_mem);
+		kvm__register_ram(kvm, phys_start, phys_size, host_mem, kvm->ram_fd, 0);
 	}
 }
 
@@ -179,11 +179,6 @@ void kvm__arch_init(struct kvm *kvm)
 	ret = ioctl(kvm->vm_fd, KVM_CREATE_IRQCHIP);
 	if (ret < 0)
 		die_perror("KVM_CREATE_IRQCHIP ioctl");
-}
-
-void kvm__arch_delete_ram(struct kvm *kvm)
-{
-	munmap(kvm->ram_start, kvm->ram_size);
 }
 
 void kvm__irq_line(struct kvm *kvm, int irq, int level)

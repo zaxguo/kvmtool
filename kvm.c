@@ -95,6 +95,19 @@ const char *kvm__get_dir(void)
 	return kvm_dir;
 }
 
+static void *_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
+{
+	return mmap(addr, len, prot, flags | MAP_FIXED, fd, offset);
+}
+
+static int _munmap(void *addr, size_t len)
+{
+	if (mmap(addr, len, PROT_NONE, MAP_SHARED | MAP_FIXED | MAP_ANON, -1, 0) != MAP_FAILED)
+		return 0;
+
+	return -EFAULT;
+}
+
 bool kvm__supports_vm_extension(struct kvm *kvm, unsigned int extension)
 {
 	static int supports_vm_ext_check = 0;
@@ -160,6 +173,7 @@ struct kvm *kvm__new(void)
 	mutex_init(&kvm->mem_banks_lock);
 	kvm->sys_fd = -1;
 	kvm->vm_fd = -1;
+	kvm->ram_fd = -1;
 
 #ifdef KVM_BRLOCK_DEBUG
 	kvm->brlock_sem = (pthread_rwlock_t) PTHREAD_RWLOCK_INITIALIZER;
@@ -168,26 +182,89 @@ struct kvm *kvm__new(void)
 	return kvm;
 }
 
+static void kvm__delete_ram(struct kvm *kvm)
+{
+	if (kvm->ram_start)
+		_munmap(kvm->ram_start, kvm->ram_size);
+
+	if (kvm->ram_fd >= 0)
+		close(kvm->ram_fd);
+}
+
 int kvm__exit(struct kvm *kvm)
 {
 	struct kvm_mem_bank *bank, *tmp;
 
-	kvm__arch_delete_ram(kvm);
+	kvm__delete_ram(kvm);
 
 	list_for_each_entry_safe(bank, tmp, &kvm->mem_banks, list) {
+		if (bank->host_addr)
+			_munmap(bank->host_addr, bank->size);
+
+		if (bank->memfd >= 0)
+			close(bank->memfd);
+
 		list_del(&bank->list);
 		free(bank);
 	}
+
+	if (kvm->vm_fd >= 0)
+		close(kvm->vm_fd);
+
+	if (kvm->sys_fd >= 0)
+		close(kvm->sys_fd);
 
 	free(kvm);
 	return 0;
 }
 core_exit(kvm__exit);
 
+
+static int set_user_memory_region(struct kvm *kvm, u32 slot, u32 flags,
+				  u64 guest_phys, u64 size,
+				  u64 userspace_addr)
+{
+	int ret = 0;
+	struct kvm_userspace_memory_region mem = {
+		.slot			= slot,
+		.flags			= flags,
+		.guest_phys_addr	= guest_phys,
+		.memory_size		= size,
+		.userspace_addr		= (unsigned long)userspace_addr,
+	};
+
+	ret = ioctl(kvm->vm_fd, KVM_SET_USER_MEMORY_REGION, &mem);
+	if (ret < 0)
+		ret = -errno;
+
+	return ret;
+}
+
+static int set_user_memory_guestfd(struct kvm *kvm, u32 slot, u32 flags,
+				   u64 guest_phys, u64 size,
+				   u64 userspace_addr, u32 fd, u64 offset)
+{
+	int ret = 0;
+	struct kvm_userspace_memory_region2 mem = {
+		.slot			= slot,
+		.flags			= flags | KVM_MEM_GUEST_MEMFD,
+		.guest_phys_addr	= guest_phys,
+		.memory_size		= size,
+		.userspace_addr		= 0,
+		.guest_memfd_offset	= offset,
+		.guest_memfd		= fd,
+	};
+
+	ret = ioctl(kvm->vm_fd, KVM_SET_USER_MEMORY_REGION2, &mem);
+	if (ret < 0)
+		ret = -errno;
+
+	return ret;
+}
+
 int kvm__destroy_mem(struct kvm *kvm, u64 guest_phys, u64 size,
 		     void *userspace_addr)
 {
-	struct kvm_userspace_memory_region mem;
 	struct kvm_mem_bank *bank;
 	int ret;
 
@@ -211,18 +288,15 @@ int kvm__destroy_mem(struct kvm *kvm, u64 guest_phys, u64 size,
 		goto out;
 	}
 
-	mem = (struct kvm_userspace_memory_region) {
-		.slot			= bank->slot,
-		.guest_phys_addr	= guest_phys,
-		.memory_size		= 0,
-		.userspace_addr		= (unsigned long)userspace_addr,
-	};
-
-	ret = ioctl(kvm->vm_fd, KVM_SET_USER_MEMORY_REGION, &mem);
-	if (ret < 0) {
-		ret = -errno;
+	if (kvm->cfg.restricted_mem && (bank->type & KVM_MEM_TYPE_GUESTFD))
+		ret = set_user_memory_guestfd(kvm, bank->slot,
+			KVM_MEM_GUEST_MEMFD, guest_phys, 0, (u64) userspace_addr,
+			0, 0);
+	else
+		ret = set_user_memory_region(kvm, bank->slot, 0,
+			guest_phys, 0, (u64) userspace_addr);
+	if (ret < 0)
 		goto out;
-	}
 
 	list_del(&bank->list);
 	free(bank);
@@ -235,9 +309,9 @@ out:
 }
 
 int kvm__register_mem(struct kvm *kvm, u64 guest_phys, u64 size,
-		      void *userspace_addr, enum kvm_mem_type type)
+		      void *userspace_addr, int memfd, u64 offset,
+		      enum kvm_mem_type type)
 {
-	struct kvm_userspace_memory_region mem;
 	struct kvm_mem_bank *merged = NULL;
 	struct kvm_mem_bank *bank;
 	struct list_head *prev_entry;
@@ -313,24 +387,22 @@ int kvm__register_mem(struct kvm *kvm, u64 guest_phys, u64 size,
 	bank->size			= size;
 	bank->type			= type;
 	bank->slot			= slot;
+	bank->memfd			= memfd;
+	bank->memfd_offset		= offset;
 
 	if (type & KVM_MEM_TYPE_READONLY)
 		flags |= KVM_MEM_READONLY;
 
 	if (type != KVM_MEM_TYPE_RESERVED) {
-		mem = (struct kvm_userspace_memory_region) {
-			.slot			= slot,
-			.flags			= flags,
-			.guest_phys_addr	= guest_phys,
-			.memory_size		= size,
-			.userspace_addr		= (unsigned long)userspace_addr,
-		};
-
-		ret = ioctl(kvm->vm_fd, KVM_SET_USER_MEMORY_REGION, &mem);
-		if (ret < 0) {
-			ret = -errno;
-			goto out;
+		if (kvm->cfg.restricted_mem && (type & KVM_MEM_TYPE_GUESTFD)) {
+			ret = set_user_memory_guestfd(kvm, slot, flags, guest_phys,
+				size, (u64) userspace_addr, memfd, offset);
+		} else {
+			ret = set_user_memory_region(kvm, slot, flags,
+				guest_phys, size, (u64) userspace_addr);
 		}
+		if (ret < 0)
+			goto out;
 	}
 
 	list_add(&bank->list, prev_entry);
@@ -381,14 +453,15 @@ u64 host_to_guest_flat(struct kvm *kvm, void *ptr)
  * their type.
  *
  * If one call to @fun returns a non-zero value, stop iterating and return the
- * value. Otherwise, return zero.
+ * value. If none of the bank types match, return -ENODEV. Otherwise, return
+ * zero.
  */
 int kvm__for_each_mem_bank(struct kvm *kvm, enum kvm_mem_type type,
 			   int (*fun)(struct kvm *kvm, struct kvm_mem_bank *bank, void *data),
 			   void *data)
 {
-	int ret;
 	struct kvm_mem_bank *bank;
+	int ret = -ENODEV;
 
 	list_for_each_entry(bank, &kvm->mem_banks, list) {
 		if (type != KVM_MEM_TYPE_ALL && !(bank->type & type))
@@ -399,6 +472,216 @@ int kvm__for_each_mem_bank(struct kvm *kvm, enum kvm_mem_type type,
 			break;
 	}
 
+	return ret;
+}
+
+struct bank_range {
+	u64 gpa;
+	u64 size;
+};
+
+static bool is_bank_range(struct kvm_mem_bank *bank, struct bank_range *range)
+{
+	u64 bank_start = bank->guest_phys_addr;
+	u64 bank_end = bank_start + bank->size;
+	u64 gpa_end = range->gpa + range->size;
+
+	if (range->gpa < bank_start || range->gpa >= bank_end)
+		return false;
+
+	if (gpa_end > bank_end || gpa_end <= bank_start) {
+		pr_warning("%s invalid guest range", __func__);
+		return false;
+	}
+
+	return true;
+}
+
+static int map_bank_range(struct kvm *kvm, struct kvm_mem_bank *bank, void *data)
+{
+	struct bank_range *range = data;
+	u64 gpa_offset;
+	u64 map_offset;
+	u64 hva;
+	void *mapping;
+
+	if (!is_bank_range(bank, range))
+		return 0;
+
+	gpa_offset = range->gpa - bank->guest_phys_addr;
+	map_offset = bank->memfd_offset + gpa_offset;
+	hva = (u64) bank->host_addr + gpa_offset;
+
+	BUG_ON(map_offset > bank->memfd_offset + bank->size);
+	BUG_ON(map_offset < bank->memfd_offset);
+	BUG_ON(hva < (u64)bank->host_addr);
+	BUG_ON(!bank->memfd);
+
+	mapping = _mmap((void *)hva, range->size, PROT_RW, MAP_SHARED, bank->memfd, map_offset);
+	if (mapping == MAP_FAILED || mapping != (void *)hva)
+		pr_warning("%s gpa 0x%llx (size: %llu) at hva 0x%llx failed with mapping 0x%llx",
+			   __func__,
+			   (unsigned long long)range->gpa,
+			   (unsigned long long)range->size,
+			   (unsigned long long)hva,
+			   (unsigned long long)mapping);
+
+	/* Do not proceed to trying to map the other banks. */
+	return 1;
+}
+
+static int unmap_bank_range(struct kvm *kvm, struct kvm_mem_bank *bank, void *data)
+{
+	struct bank_range *range = data;
+	u64 gpa_offset;
+	u64 hva;
+	int ret;
+
+	if (!is_bank_range(bank, range))
+		return 0;
+
+	gpa_offset = range->gpa - bank->guest_phys_addr;
+	hva = (u64)bank->host_addr + gpa_offset;
+
+	BUG_ON(hva < (u64)bank->host_addr);
+	BUG_ON(!bank->memfd);
+
+	ret = _munmap((void *)hva, range->size);
+	if (ret)
+		pr_warning("%s gpa 0x%llx (size: %llu) at hva 0x%llx failed with error %d",
+			 __func__,
+			 (unsigned long long)range->gpa,
+			 (unsigned long long)range->size,
+			 (unsigned long long)hva,
+			 ret);
+
+	/* Do not proceed to trying to unmap the other banks. */
+	return 1;
+}
+
+static int map_bank(struct kvm *kvm, struct kvm_mem_bank *bank, void *data)
+{
+	void *mapping;
+
+	BUG_ON(!bank->memfd);
+
+	pr_debug("%s hva 0x%llx (size: %llu) of memfd %d (offset %llu)",
+		 __func__,
+		 (unsigned long long)bank->host_addr,
+		 (unsigned long long)bank->size,
+		 bank->memfd,
+		 (unsigned long long)bank->memfd_offset);
+
+	mapping = _mmap(bank->host_addr, bank->size, PROT_RW, MAP_SHARED, bank->memfd, bank->memfd_offset);
+	if (!mapping || mapping != bank->host_addr)
+		pr_warning("%s hva 0x%llx (size: %llu) failed with return 0x%llx",
+			   __func__,
+			   (unsigned long long)bank->host_addr,
+			   (unsigned long long)bank->size,
+			   (unsigned long long)mapping);
+	return 0;
+}
+
+static int unmap_bank(struct kvm *kvm, struct kvm_mem_bank *bank, void *data)
+{
+	int ret;
+
+	pr_debug("%s hva 0x%llx (size: %llu)",
+		 __func__,
+		 (unsigned long long)bank->host_addr,
+		 (unsigned long long)bank->size);
+
+	ret = _munmap(bank->host_addr, bank->size);
+	if (ret)
+		pr_warning("%s hva 0x%llx (size: %llu) failed with error %d",
+			   __func__,
+			   (unsigned long long)bank->host_addr,
+			   (unsigned long long)bank->size,
+			   ret);
+	return 0;
+}
+
+static int set_guest_bank_private(struct kvm *kvm, struct kvm_mem_bank *bank, void *data)
+{
+	pr_debug("%s gpa 0x%llx (size: %llu)",
+		 __func__,
+		 (unsigned long long)bank->guest_phys_addr,
+		 (unsigned long long)bank->size);
+
+	return set_guest_memory_attributes(kvm, bank->guest_phys_addr,
+					   bank->size,
+					   KVM_MEMORY_ATTRIBUTE_PRIVATE);
+}
+
+void map_guest_range(struct kvm *kvm, u64 gpa, u64 size)
+{
+	struct bank_range range = { .gpa = gpa, .size = size };
+	int ret;
+
+	ret = kvm__for_each_mem_bank(kvm, KVM_MEM_TYPE_RAM|KVM_MEM_TYPE_DEVICE,
+				     map_bank_range, &range);
+
+	if (!ret)
+		pr_warning("%s gpa 0x%llx (size: %llu) found no matches",
+			   __func__,
+			   (unsigned long long)gpa,
+			   (unsigned long long)size);
+}
+
+void unmap_guest_range(struct kvm *kvm, u64 gpa, u64 size)
+{
+	struct bank_range range = { .gpa = gpa, .size = size };
+	int ret;
+
+	ret = kvm__for_each_mem_bank(kvm, KVM_MEM_TYPE_RAM|KVM_MEM_TYPE_DEVICE,
+				     unmap_bank_range, &range);
+
+	if (!ret)
+		pr_warning("%s gpa 0x%llx (size: %llu) found no matches",
+			   __func__,
+			   (unsigned long long)gpa,
+			   (unsigned long long)size);
+
+	return;
+}
+
+void map_guest(struct kvm *kvm)
+{
+	kvm__for_each_mem_bank(kvm, KVM_MEM_TYPE_RAM|KVM_MEM_TYPE_DEVICE,
+			       map_bank, NULL);
+}
+
+void unmap_guest_private(struct kvm *kvm)
+{
+	kvm__for_each_mem_bank(kvm, KVM_MEM_TYPE_GUESTFD, unmap_bank, NULL);
+}
+
+void set_guest_memory_private(struct kvm *kvm)
+{
+	kvm__for_each_mem_bank(kvm, KVM_MEM_TYPE_GUESTFD, set_guest_bank_private, NULL);
+}
+
+int set_guest_memory_attributes(struct kvm *kvm, u64 gpa, u64 size, u64 attributes)
+{
+	struct kvm_memory_attributes attr = {
+		.address = gpa,
+		.size = size,
+		.attributes = attributes,
+		.flags = 0,
+	};
+	int ret;
+
+	ret = ioctl(kvm->vm_fd, KVM_SET_MEMORY_ATTRIBUTES, &attr);
+	//if (ret || attr.size != 0)
+	if (ret) // TODO: might change
+		ret = -errno;
+
+	if (ret)
+		pr_warning("%s hva 0x%llx (size: %llu) failed with error %d",
+			   __func__,
+			   (unsigned long long)gpa,
+			   (unsigned long long)size,
+			   ret);
 	return ret;
 }
 
