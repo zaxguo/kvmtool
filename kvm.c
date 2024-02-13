@@ -247,7 +247,7 @@ static int set_user_memory_guestfd(struct kvm *kvm, u32 slot, u32 flags,
 	int ret = 0;
 	struct kvm_userspace_memory_region2 mem = {
 		.slot			= slot,
-		.flags			= flags | KVM_MEM_PRIVATE,
+		.flags			= flags | KVM_MEM_GUEST_MEMFD,
 		.guest_phys_addr	= guest_phys,
 		.memory_size		= size,
 		.userspace_addr		= 0,
