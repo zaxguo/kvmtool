@@ -290,7 +290,7 @@ int kvm__destroy_mem(struct kvm *kvm, u64 guest_phys, u64 size,
 
 	if (kvm->cfg.restricted_mem && (bank->type & KVM_MEM_TYPE_GUESTFD))
 		ret = set_user_memory_guestfd(kvm, bank->slot,
-			KVM_MEM_PRIVATE, guest_phys, 0, (u64) userspace_addr,
+			KVM_MEM_GUEST_MEMFD, guest_phys, 0, (u64) userspace_addr,
 			0, 0);
 	else
 		ret = set_user_memory_region(kvm, bank->slot, 0,
