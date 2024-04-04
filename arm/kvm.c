@@ -29,7 +29,7 @@ bool kvm__arch_cpu_supports_vm(void)
 
 static void try_increase_mlock_limit(struct kvm *kvm)
 {
-	u64 size = kvm->arch.ram_alloc_size;
+	u64 size = kvm->ram_size;
 	struct rlimit mlock_limit, new_limit;
 
 	if (getrlimit(RLIMIT_MEMLOCK, &mlock_limit)) {
@@ -66,9 +66,6 @@ void kvm__init_ram(struct kvm *kvm)
 		die("Failed to map %lld bytes for guest memory (%d)",
 		    kvm->ram_size, errno);
 
-	kvm->ram_start = (void *)ALIGN((unsigned long)kvm->arch.ram_alloc_start,
-					SZ_2M);
-
 	/*
 	 * Do not merge pages if this is a Realm.
 	 *  a) We cannot replace a page in realm stage2 without export/import
@@ -83,16 +80,14 @@ void kvm__init_ram(struct kvm *kvm)
 		int ret;
 
 		try_increase_mlock_limit(kvm);
-		ret = mlock2(kvm->arch.ram_alloc_start, kvm->arch.ram_alloc_size,
-			     MLOCK_ONFAULT);
+		ret = mlock2(kvm->ram_start, kvm->ram_size, MLOCK_ONFAULT);
 		if (ret)
 			die_perror("mlock2");
 	} else {
-		madvise(kvm->arch.ram_alloc_start, kvm->arch.ram_alloc_size, MADV_MERGEABLE);
+		madvise(kvm->ram_start, kvm->ram_size, MADV_MERGEABLE);
 	}
 
-	madvise(kvm->arch.ram_alloc_start, kvm->arch.ram_alloc_size,
-		MADV_HUGEPAGE);
+	madvise(kvm->ram_start, kvm->ram_size, MADV_HUGEPAGE);
 
 	phys_start	= kvm->cfg.ram_addr;
 	phys_size	= kvm->ram_size;
